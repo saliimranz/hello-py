@@ -8,6 +8,9 @@ from typing import Any, TypedDict
 from anthropic import AsyncAnthropic
 from anthropic.types import MessageParam, ToolUnionParam
 
+from grader import grade
+import json
+
 MAX_TOKENS = 1000
 
 
@@ -249,7 +252,7 @@ async def main(concurrent: bool = True):
             tools=tools,
             tool_handlers=tool_handlers,
             expected_answer=expected_answer,
-            verbose=False,
+            verbose=True,
         )
         for i in range(num_runs)
     ]

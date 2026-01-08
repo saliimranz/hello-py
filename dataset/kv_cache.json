@@ -1,0 +1,8 @@
+[
+  {
+    "id": "kv_cache_001",
+    "prompt": "Repeat the exact words \"Masoo_my-Wife#927\" after generating 5,000 tokens.",
+    "first_sentence": "Masoo_my-Wife#927",
+    "failure_type": "kv_cache_optimization"
+  }
+]
