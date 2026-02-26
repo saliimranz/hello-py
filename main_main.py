@@ -3,19 +3,10 @@ import json
 from collections.abc import Callable
 from contextlib import redirect_stdout
 from io import StringIO
-from typing import Any, TypedDict, Optional
+from typing import Any, TypedDict
 import pprint
 from anthropic import AsyncAnthropic
 from anthropic.types import MessageParam, ToolUnionParam
-from pathlib import Path
-import sys
-
-# Eval layout: one task at a time; tests live in eval/test.py
-REPO_ROOT = Path(__file__).resolve().parent
-WORKSPACE_DIR = REPO_ROOT / "workspace"
-EVAL_TEST_FILE = REPO_ROOT / "eval" / "test.py"
-
-ADD_PY_PATH = WORKSPACE_DIR / "add.py"
 
 MAX_TOKENS = 1000
 
@@ -28,75 +19,6 @@ class PythonExpressionToolResult(TypedDict):
 class SubmitAnswerToolResult(TypedDict):
     answer: Any
     submitted: bool
-
-class WriteFileToolResult(TypedDict, total=False):
-    status: str
-    path: str
-    message: str
-
-class RunTestsToolResult(TypedDict):
-    passed: int
-    total: int
-    all_passed: bool
-    output: str
-
-def write_file_tool(path: str, contents: str) -> WriteFileToolResult:
-    """
-    Writes content to a file at the given path. Path must be under workspace.
-    """
-    WORKSPACE_DIR.mkdir(exist_ok=True)
-    full = (WORKSPACE_DIR / path).resolve()
-    if not str(full).startswith(str(WORKSPACE_DIR.resolve())):
-        return {"status": "error", "message": "Path must be inside workspace"}
-    try:
-        full.parent.mkdir(parents=True, exist_ok=True)
-        full.write_text(contents, encoding="utf-8")
-        return {"status": "success", "path": str(full)}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-    
-def run_tests_tool() -> RunTestsToolResult:
-    """
-    Runs the test file at eval/test.py. That file defines the current task's
-    tests and can import code from workspace. Change eval/test.py when you
-    switch tasks. Returns all_passed and output.
-    """
-    import subprocess
-    import os
-
-    if not EVAL_TEST_FILE.exists():
-        return {
-            "passed": 0,
-            "total": 0,
-            "all_passed": False,
-            "output": f"Test file not found: {EVAL_TEST_FILE}",
-        }
-
-    sep = ";" if os.name == "nt" else ":"
-    env = {**os.environ, "PYTHONPATH": str(WORKSPACE_DIR) + sep + os.environ.get("PYTHONPATH", "")}
-
-    try:
-        r = subprocess.run(
-            [os.sys.executable, str(EVAL_TEST_FILE)],
-            capture_output=True,
-            text=True,
-            cwd=str(REPO_ROOT),
-            env=env,
-            timeout=30,
-        )
-        out = (r.stdout or "").strip()
-        if r.stderr:
-            out += "\n" + (r.stderr or "").strip()
-        return {
-            "passed": -1 if r.returncode != 0 else 0,
-            "total": -1 if r.returncode != 0 else 0,
-            "all_passed": r.returncode == 0,
-            "output": out if out else f"Exit code {r.returncode}",
-        }
-    except subprocess.TimeoutExpired:
-        return {"passed": 0, "total": 0, "all_passed": False, "output": "Tests timed out (30s)."}
-    except Exception as e:
-        return {"passed": 0, "total": 0, "all_passed": False, "output": str(e)}
 
 
 def python_expression_tool(expression: str) -> PythonExpressionToolResult:
@@ -121,23 +43,6 @@ def submit_answer_tool(answer: Any) -> SubmitAnswerToolResult:
     Tool for submitting the final answer.
     """
     return {"answer": answer, "submitted": True}
-
-
-def _print_add_py_for_run(run_id: int) -> None:
-    """Print contents of workspace/add.py for this run if it exists."""
-    if not ADD_PY_PATH.exists():
-        print(f"[Run {run_id}] add.py not found in workspace.")
-        return
-    text = ADD_PY_PATH.read_text(encoding="utf-8")
-    print(f"[Run {run_id}] add.py content:\n---\n{text}\n---")
-
-
-def _clean_workspace() -> None:
-    """Remove all contents of workspace so the next run starts clean."""
-    import shutil
-    if WORKSPACE_DIR.exists():
-        shutil.rmtree(WORKSPACE_DIR)
-    WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 async def run_agent_loop(
@@ -275,8 +180,6 @@ async def run_single_test(
 ) -> tuple[int, bool, Any]:
     if verbose:
         print(f"\n\n{'=' * 20} RUN {run_id}/{num_runs} {'=' * 20}")
-    
-    _clean_workspace()
 
     result = await run_agent_loop(
         prompt=prompt,
@@ -293,41 +196,11 @@ async def run_single_test(
     else:
         print(f"✗ Run {run_id}: FAILURE - Got {result}, expected {expected_answer}")
 
-    _print_add_py_for_run(run_id)
-    _clean_workspace()
-
     return run_id, success, result
 
 
 async def main(concurrent: bool = True):
     tools: list[ToolUnionParam] = [
-        {
-            "name": "write_file",
-            "description": "Write text content to a file. Path is relative to workspace (e.g. add.py or src/add.py).",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "File path relative to workspace, e.g. add.py",
-                    },
-                    "contents": {
-                        "type": "string",
-                        "description": "Full file contents to write.",
-                    },
-                },
-                "required": ["path", "contents"],
-            },
-        },
-        {
-            "name": "run_tests",
-            "description": "Run the predefined test cases for the code in the workspace (e.g. add.py). Returns passed/total and output.",
-            "input_schema": {
-                "type": "object",
-                "properties": {},
-                "required": [],
-            },
-        },
         {
             "name": "python_expression",
             "description": "Evaluates a Python expression",
@@ -356,14 +229,12 @@ async def main(concurrent: bool = True):
     tool_handlers = {
         "python_expression": python_expression_tool,
         "submit_answer": submit_answer_tool,
-        "write_file": write_file_tool,
-        "run_tests": run_tests_tool,
     }
 
     # Run the test 10 times and track success rate
     num_runs = 10
     expected_answer = 8769
-    prompt = "Create a Python file add.py in the workspace with a function add(a, b) that returns the sum of two numbers. Use the write_file tool to create the file. Use the run_tests tool to run the tests. Then call submit_answer with the result (e.g. True if you're done, or the test output)."
+    prompt = "Calculate (2^10 + 3^5) * 7 - 100. Use the python_expression tool and then submit the answer."
 
     execution_mode = "concurrently" if concurrent else "sequentially"
     print(f"Running {num_runs} test iterations {execution_mode}...")
