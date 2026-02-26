@@ -1,7 +1,7 @@
-# eval/test/test.py – replace this file when you switch tasks
+# eval/test.py – replace this file when you switch tasks
 import sys
 from pathlib import Path
-workspace = Path(__file__).resolve().parent.parent.parent / "workspace"
+workspace = Path(__file__).resolve().parent.parent / "workspace"
 sys.path.insert(0, str(workspace))
 
 import add

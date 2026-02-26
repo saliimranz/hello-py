@@ -160,10 +160,11 @@ async def run_agent_loop(
         verbose: Whether to print detailed output (default True)
 
     Returns:
-        The submitted answer if submit_answer was called, otherwise None
+        A dict with submitted_answer and last_run_tests
     """
     client = AsyncAnthropic()
     messages: list[MessageParam] = [{"role": "user", "content": prompt}]
+    last_run_tests: RunTestsToolResult | None = None
 
     for step in range(max_steps):
         if verbose:
@@ -234,6 +235,9 @@ async def run_agent_loop(
                             else handler(tool_input)
                         )
 
+                    if tool_name == "run_tests":
+                        last_run_tests = result 
+
                     tool_results.append(
                         {
                             "type": "tool_result",
@@ -252,16 +256,19 @@ async def run_agent_loop(
             if submitted_answer is not None:
                 if verbose:
                     print(f"\nAgent submitted answer: {submitted_answer}")
-                return submitted_answer
+                break
         else:
             # No tool use, conversation might be complete
             if verbose:
                 print("\nNo tool use in response, ending loop.")
             break
 
-    if verbose:
+    if verbose and submitted_answer is None:
         print(f"\nReached maximum steps ({max_steps}) without submitting answer.")
-    return None
+    return {
+        "submitted_answer": submitted_answer,
+        "last_run_tests": last_run_tests,
+    }
 
 
 async def run_single_test(
@@ -270,7 +277,6 @@ async def run_single_test(
     prompt: str,
     tools: list[ToolUnionParam],
     tool_handlers: dict[str, Callable[..., Any]],
-    expected_answer: Any,
     verbose: bool = True,
 ) -> tuple[int, bool, Any]:
     if verbose:
@@ -286,20 +292,29 @@ async def run_single_test(
         verbose=verbose,
     )
 
-    success = result == expected_answer
-
-    if success:
-        print(f"✓ Run {run_id}: SUCCESS - Got {result}")
+    judge = result.get("last_run_tests") if isinstance(result, dict) else None
+    if judge is None:
+        success = False
+        print(f"✗ Run {run_id}: FAILURE - Model did not call run_tests")
+        output = ""
     else:
-        print(f"✗ Run {run_id}: FAILURE - Got {result}, expected {expected_answer}")
+        success = judge.get("all_passed", False)
+        output = judge.get("output", "")
+
+        if success:
+            print(f"✓ Run {run_id}: SUCCESS - Tests passed")
+        else:
+            print(f"✗ Run {run_id}: FAILURE - Tests failed")
+            if output:
+                print(f"  Output: {output[:500]}")
 
     _print_add_py_for_run(run_id)
     _clean_workspace()
 
-    return run_id, success, result
+    return run_id, success, output
 
 
-async def main(concurrent: bool = True):
+async def main(concurrent: bool = False):
     tools: list[ToolUnionParam] = [
         {
             "name": "write_file",
@@ -362,7 +377,6 @@ async def main(concurrent: bool = True):
 
     # Run the test 10 times and track success rate
     num_runs = 10
-    expected_answer = 8769
     prompt = "Create a Python file add.py in the workspace with a function add(a, b) that returns the sum of two numbers. Use the write_file tool to create the file. Use the run_tests tool to run the tests. Then call submit_answer with the result (e.g. True if you're done, or the test output)."
 
     execution_mode = "concurrently" if concurrent else "sequentially"
@@ -377,7 +391,6 @@ async def main(concurrent: bool = True):
             prompt=prompt,
             tools=tools,
             tool_handlers=tool_handlers,
-            expected_answer=expected_answer,
             verbose=True,
         )
         for i in range(num_runs)
@@ -412,4 +425,4 @@ async def main(concurrent: bool = True):
 
 if __name__ == "__main__":
     # Set to True for concurrent execution, False for sequential execution
-    asyncio.run(main(concurrent=True))
+    asyncio.run(main(concurrent=False))
