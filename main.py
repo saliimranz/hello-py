@@ -15,9 +15,9 @@ REPO_ROOT = Path(__file__).resolve().parent
 WORKSPACE_DIR = REPO_ROOT / "workspace"
 EVAL_TEST_FILE = REPO_ROOT / "eval" / "test.py"
 
-ADD_PY_PATH = WORKSPACE_DIR / "add.py"
+ADD_PY_PATH = WORKSPACE_DIR / "quantize.py"
 
-MAX_TOKENS = 1000
+MAX_TOKENS = 2000
 
 
 class PythonExpressionToolResult(TypedDict):
@@ -70,6 +70,7 @@ def run_tests_tool() -> RunTestsToolResult:
             "total": 0,
             "all_passed": False,
             "output": f"Test file not found: {EVAL_TEST_FILE}",
+            "metrics": {},
         }
 
     sep = ";" if os.name == "nt" else ":"
@@ -84,19 +85,33 @@ def run_tests_tool() -> RunTestsToolResult:
             env=env,
             timeout=30,
         )
-        out = (r.stdout or "").strip()
-        if r.stderr:
-            out += "\n" + (r.stderr or "").strip()
+        stdout = (r.stdout or "").strip()
+        stderr = (r.stderr or "").strip()
+        output = stdout + ("\n" + stderr if stderr else "")
+
+        metrics = {}
+        if stdout:
+            *_, last = stdout.splitlines()
+            import json
+            try:
+                metrics = json.loads(last)
+            except Exception:
+                metrics = {}
+                # Debug: print test run output so tracebacks are visible
+        print("[run_tests] --- begin ---")
+        print(output)
+        print("[run_tests] --- end ---")
         return {
-            "passed": -1 if r.returncode != 0 else 0,
-            "total": -1 if r.returncode != 0 else 0,
+            "passed": 0,
+            "total": 0,
             "all_passed": r.returncode == 0,
-            "output": out if out else f"Exit code {r.returncode}",
+            "output": output,
+            "metrics": metrics,
         }
     except subprocess.TimeoutExpired:
-        return {"passed": 0, "total": 0, "all_passed": False, "output": "Tests timed out (30s)."}
+        return {"passed": 0, "total": 0, "all_passed": False, "output": "Tests timed out (30s).", "metrics": {}}
     except Exception as e:
-        return {"passed": 0, "total": 0, "all_passed": False, "output": str(e)}
+        return {"passed": 0, "total": 0, "all_passed": False, "output": str(e), "metrics": {}}
 
 
 def python_expression_tool(expression: str) -> PythonExpressionToolResult:
@@ -124,9 +139,9 @@ def submit_answer_tool(answer: Any) -> SubmitAnswerToolResult:
 
 
 def _print_add_py_for_run(run_id: int) -> None:
-    """Print contents of workspace/add.py for this run if it exists."""
+    """Print contents of workspace/quantize.py for this run if it exists."""
     if not ADD_PY_PATH.exists():
-        print(f"[Run {run_id}] add.py not found in workspace.")
+        print(f"[Run {run_id}] quantize.py not found in workspace.")
         return
     text = ADD_PY_PATH.read_text(encoding="utf-8")
     print(f"[Run {run_id}] add.py content:\n---\n{text}\n---")
@@ -138,6 +153,70 @@ def _clean_workspace() -> None:
     if WORKSPACE_DIR.exists():
         shutil.rmtree(WORKSPACE_DIR)
     WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
+
+def judge_run(submitted_answer: Any, tests_result: RunTestsToolResult | None) -> dict:
+    """
+    Judge a single run based on metrics from eval/test.py.
+
+    tests_result["metrics"] is expected to contain:
+      - base_model_size_bytes
+      - quantized_model_size_bytes
+      - base_ppl
+      - quantized_ppl
+      - has_fp16_params
+    """
+    if tests_result is None:
+        return {
+            "final_score": 0.0,
+            "compression": 0.0,
+            "ppl_increase": float("inf"),
+            "passed": False,
+        }
+
+    m = tests_result.get("metrics", {}) or {}
+
+    base_size = float(m.get("base_model_size_bytes", 0.0))
+    quant_size = float(m.get("quantized_model_size_bytes", 0.0))
+    base_ppl = float(m.get("base_ppl", 0.0))
+    quant_ppl = float(m.get("quantized_ppl", 0.0))
+    has_fp16 = bool(m.get("has_fp16_params", True))  # default to True (fail-safe)
+
+    # 1) compression ratio
+    if quant_size <= 0 or base_size <= 0:
+        compression = 0.0
+    else:
+        compression = base_size / quant_size
+
+    # 2) perplexity degradation
+    if base_ppl <= 0:
+        ppl_increase = float("inf")
+    else:
+        ppl_increase = (quant_ppl - base_ppl) / base_ppl
+
+    # 3) compression_score (expect ~2x for fp16 -> int8)
+    compression_score = min(compression / 2.0, 1.0)
+
+    # 4) accuracy_score (tolerate up to 20% increase)
+    accuracy_score = max(0.0, 1.0 - (ppl_increase / 0.20))
+
+    # 5) combined score
+    final_score = 0.6 * accuracy_score + 0.4 * compression_score
+
+    # 6) hard fail conditions
+    hard_fail = (
+        compression < 1.8
+        or ppl_increase > 0.25
+        or has_fp16
+    )
+
+    passed = (not hard_fail)
+
+    return {
+        "final_score": float(final_score),
+        "compression": float(compression),
+        "ppl_increase": float(ppl_increase),
+        "passed": bool(passed),
+    }
 
 
 async def run_agent_loop(
@@ -288,30 +367,31 @@ async def run_single_test(
         prompt=prompt,
         tools=tools,
         tool_handlers=tool_handlers,
-        max_steps=5,
+        max_steps=10,
         verbose=verbose,
     )
 
-    judge = result.get("last_run_tests") if isinstance(result, dict) else None
-    if judge is None:
-        success = False
-        print(f"✗ Run {run_id}: FAILURE - Model did not call run_tests")
-        output = ""
+    tests = result.get("last_run_tests") if isinstance(result, dict) else None
+    judge = judge_run(
+        submitted_answer=result.get("submitted_answer") if isinstance(result, dict) else None,
+        tests_result=tests,
+    )
+
+    success = judge["passed"]
+
+    if success:
+        print(f"✓ Run {run_id}: SUCCESS - final_score={judge['final_score']:.3f}")
     else:
-        success = judge.get("all_passed", False)
-        output = judge.get("output", "")
-
-        if success:
-            print(f"✓ Run {run_id}: SUCCESS - Tests passed")
-        else:
-            print(f"✗ Run {run_id}: FAILURE - Tests failed")
-            if output:
-                print(f"  Output: {output[:500]}")
-
+        print(f"✗ Run {run_id}: FAILURE - final_score={judge['final_score']:.3f}")
+        print(f"  compression={judge['compression']:.3f}, ppl_increase={judge['ppl_increase']:.3f}")
+        if tests and tests.get("output"):
+            print(f"  --- run_tests output ---")
+            print(tests["output"])
+            print(f"  --- end run_tests output ---")
     _print_add_py_for_run(run_id)
     _clean_workspace()
 
-    return run_id, success, output
+    return run_id, success, judge
 
 
 async def main(concurrent: bool = False):
@@ -344,20 +424,6 @@ async def main(concurrent: bool = False):
             },
         },
         {
-            "name": "python_expression",
-            "description": "Evaluates a Python expression",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "expression": {
-                        "type": "string",
-                        "description": "Will be passed to exec(). Use print() to output something. Returns stdout. ",
-                    }
-                },
-                "required": ["expression"],
-            },
-        },
-        {
             "name": "submit_answer",
             "description": "Submit the final answer",
             "input_schema": {
@@ -369,16 +435,27 @@ async def main(concurrent: bool = False):
     ]
 
     tool_handlers = {
-        "python_expression": python_expression_tool,
         "submit_answer": submit_answer_tool,
         "write_file": write_file_tool,
         "run_tests": run_tests_tool,
     }
 
     # Run the test 10 times and track success rate
-    num_runs = 10
-    prompt = "Create a Python file add.py in the workspace with a function add(a, b) that returns the sum of two numbers. Use the write_file tool to create the file. Use the run_tests tool to run the tests. Then call submit_answer with the result (e.g. True if you're done, or the test output)."
-
+    num_runs = 1
+    prompt = (
+    "Create a Python file quantize.py in the workspace with a function "
+    "quantize_model(model) that takes a fp16 HuggingFace causal language model "
+    "and returns an 8-bit/int8 version of the same model.\n\n"
+    "Requirements:\n"
+    "1) Do not change the model architecture.\n"
+    "2) The returned model must actually use 8-bit/int8 weights (e.g. via bitsandbytes "
+    "or another standard quantization approach).\n"
+    "3) Keep the function in a single file quantize.py so it can be imported as "
+    "`import quantize; quantize.quantize_model(model)`.\n\n"
+    "Use the write_file tool to create or update workspace/quantize.py with your code. "
+    "Then use the run_tests tool to run eval/test.py, which will check size reduction "
+    "and perplexity on a sample prompt."
+)
     execution_mode = "concurrently" if concurrent else "sequentially"
     print(f"Running {num_runs} test iterations {execution_mode}...")
     print("=" * 60)
