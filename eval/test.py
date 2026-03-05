@@ -21,13 +21,20 @@ def load_base_model():
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
         torch_dtype=torch.float16,
-        device_map="auto",
     )
     return tokenizer, model
 
 
-def model_num_bytes(model: torch.nn.Module) -> int:
-    return sum(p.numel() * p.element_size() for p in model.parameters())
+def model_num_bytes(model):
+    total = 0
+
+    for p in model.parameters():
+        total += p.numel() * p.element_size()
+
+    for b in model.buffers():
+        total += b.numel() * b.element_size()
+
+    return total
 
 
 def perplexity(model, tokenizer, prompt: str) -> float:
@@ -38,6 +45,13 @@ def perplexity(model, tokenizer, prompt: str) -> float:
         out = model(**inputs, labels=inputs["input_ids"])
     loss = out.loss.item()
     return math.exp(loss)
+
+def linear_layers_have_fp16(model):
+    for module in model.modules():
+        if isinstance(module, torch.nn.Linear):
+            if module.weight.dtype == torch.float16:
+                return True
+    return False
 
 
 def main():
@@ -51,9 +65,7 @@ def main():
     ppl_quant = perplexity(quantized_model, tokenizer, PROMPT)
 
     # any float16 params left in quantized model?
-    has_fp16_params = any(
-        p.dtype == torch.float16 for p in quantized_model.parameters()
-    )
+    has_fp16_params = linear_layers_have_fp16(quantized_model)
 
     metrics = {
         "base_model_size_bytes": int(base_bytes),

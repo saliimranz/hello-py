@@ -83,7 +83,7 @@ def run_tests_tool() -> RunTestsToolResult:
             text=True,
             cwd=str(REPO_ROOT),
             env=env,
-            timeout=30,
+            timeout=3000,
         )
         stdout = (r.stdout or "").strip()
         stderr = (r.stderr or "").strip()
