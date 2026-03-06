@@ -3,6 +3,7 @@ import math
 from pathlib import Path
 import sys
 import torch
+import copy
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -53,26 +54,34 @@ def linear_layers_have_fp16(model):
                 return True
     return False
 
+def linear_layers_have_non_int8_weights(model):
+    for module in model.modules():
+        if hasattr(module, "weight_quant"):
+            if module.weight_quant.dtype != torch.int8:
+                return True
+    return False
+
+
 
 def main():
     tokenizer, base_model = load_base_model()
-    quantized_model = quantize.quantize_model(base_model)
-
     base_bytes = model_num_bytes(base_model)
-    quant_bytes = model_num_bytes(quantized_model)
-
     ppl_base = perplexity(base_model, tokenizer, PROMPT)
+
+    quantized_model = copy.deepcopy(base_model)
+    quantized_model = quantize.quantize_model(quantized_model)
+    quant_bytes = model_num_bytes(quantized_model)
     ppl_quant = perplexity(quantized_model, tokenizer, PROMPT)
 
     # any float16 params left in quantized model?
-    has_fp16_params = linear_layers_have_fp16(quantized_model)
+    has_non_int8_params = linear_layers_have_non_int8_weights(quantized_model)
 
     metrics = {
         "base_model_size_bytes": int(base_bytes),
         "quantized_model_size_bytes": int(quant_bytes),
         "base_ppl": float(ppl_base),
         "quantized_ppl": float(ppl_quant),
-        "has_fp16_params": bool(has_fp16_params),
+        "has_non_int8_params": bool(has_non_int8_params),
     }
     print(json.dumps(metrics))
 

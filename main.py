@@ -17,7 +17,7 @@ EVAL_TEST_FILE = REPO_ROOT / "eval" / "test.py"
 
 ADD_PY_PATH = WORKSPACE_DIR / "quantize.py"
 
-MAX_TOKENS = 2000
+MAX_TOKENS = 20000
 
 
 class PythonExpressionToolResult(TypedDict):
@@ -34,11 +34,13 @@ class WriteFileToolResult(TypedDict, total=False):
     path: str
     message: str
 
-class RunTestsToolResult(TypedDict):
+class RunTestsToolResult(TypedDict, total=False):
     passed: int
     total: int
     all_passed: bool
     output: str
+    metrics: dict[str, Any]
+    judge: dict[str, Any]
 
 def write_file_tool(path: str, contents: str) -> WriteFileToolResult:
     """
@@ -57,9 +59,8 @@ def write_file_tool(path: str, contents: str) -> WriteFileToolResult:
     
 def run_tests_tool() -> RunTestsToolResult:
     """
-    Runs the test file at eval/test.py. That file defines the current task's
-    tests and can import code from workspace. Change eval/test.py when you
-    switch tasks. Returns all_passed and output.
+    Runs eval/test.py, parses JSON metrics from stdout, then applies judge_run().
+    Returns judge-aligned all_passed so the model sees real status.
     """
     import subprocess
     import os
@@ -71,48 +72,131 @@ def run_tests_tool() -> RunTestsToolResult:
             "all_passed": False,
             "output": f"Test file not found: {EVAL_TEST_FILE}",
             "metrics": {},
+            "judge": {
+                "final_score": 0.0,
+                "compression": 0.0,
+                "ppl_increase": float("inf"),
+                "passed": False,
+            },
         }
 
     sep = ";" if os.name == "nt" else ":"
-    env = {**os.environ, "PYTHONPATH": str(WORKSPACE_DIR) + sep + os.environ.get("PYTHONPATH", "")}
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(WORKSPACE_DIR) + sep + os.environ.get("PYTHONPATH", ""),
+    }
 
     try:
         r = subprocess.run(
-            [os.sys.executable, str(EVAL_TEST_FILE)],
+            [sys.executable, str(EVAL_TEST_FILE)],   # <- use sys.executable
             capture_output=True,
             text=True,
             cwd=str(REPO_ROOT),
             env=env,
             timeout=3000,
         )
+
         stdout = (r.stdout or "").strip()
         stderr = (r.stderr or "").strip()
         output = stdout + ("\n" + stderr if stderr else "")
 
-        metrics = {}
+        # If test script crashed, fail immediately with traceback
+        if r.returncode != 0:
+            judge = {
+                "final_score": 0.0,
+                "compression": 0.0,
+                "ppl_increase": float("inf"),
+                "passed": False,
+            }
+            return {
+                "passed": 0,
+                "total": 0,
+                "all_passed": False,
+                "output": output or f"eval/test.py failed with exit code {r.returncode}",
+                "metrics": {},
+                "judge": judge,
+            }
+
+        # Parse JSON metrics from last stdout line
+        metrics: dict[str, Any] = {}
+        parse_error = None
         if stdout:
             *_, last = stdout.splitlines()
-            import json
             try:
                 metrics = json.loads(last)
-            except Exception:
-                metrics = {}
-                # Debug: print test run output so tracebacks are visible
-        print("[run_tests] --- begin ---")
-        print(output)
-        print("[run_tests] --- end ---")
+            except Exception as e:
+                parse_error = str(e)
+
+        if not metrics:
+            judge = {
+                "final_score": 0.0,
+                "compression": 0.0,
+                "ppl_increase": float("inf"),
+                "passed": False,
+            }
+            msg = "No valid JSON metrics produced by eval/test.py."
+            if parse_error:
+                msg += f" JSON parse error: {parse_error}"
+            if output:
+                msg += f"\nRaw output:\n{output}"
+            return {
+                "passed": 0,
+                "total": 0,
+                "all_passed": False,
+                "output": msg,
+                "metrics": {},
+                "judge": judge,
+            }
+
+        # Judge based on metrics (single source of truth)
+        judge = judge_run(submitted_answer=None, tests_result={"metrics": metrics})
+
+        # Give model a clear picture
+        judge_summary = (
+            f"judge_passed={judge['passed']}, final_score={judge['final_score']:.3f}, "
+            f"compression={judge['compression']:.3f}, ppl_increase={judge['ppl_increase']:.3f}"
+        )
+        full_output = (output + "\n" if output else "") + judge_summary
+
         return {
             "passed": 0,
             "total": 0,
-            "all_passed": r.returncode == 0,
-            "output": output,
+            "all_passed": bool(judge["passed"]),  # <- judge, not subprocess code
+            "output": full_output,
             "metrics": metrics,
+            "judge": judge,
         }
-    except subprocess.TimeoutExpired:
-        return {"passed": 0, "total": 0, "all_passed": False, "output": "Tests timed out (30s).", "metrics": {}}
-    except Exception as e:
-        return {"passed": 0, "total": 0, "all_passed": False, "output": str(e), "metrics": {}}
 
+    except subprocess.TimeoutExpired:
+        judge = {
+            "final_score": 0.0,
+            "compression": 0.0,
+            "ppl_increase": float("inf"),
+            "passed": False,
+        }
+        return {
+            "passed": 0,
+            "total": 0,
+            "all_passed": False,
+            "output": "Tests timed out (3000s).",
+            "metrics": {},
+            "judge": judge,
+        }
+    except Exception as e:
+        judge = {
+            "final_score": 0.0,
+            "compression": 0.0,
+            "ppl_increase": float("inf"),
+            "passed": False,
+        }
+        return {
+            "passed": 0,
+            "total": 0,
+            "all_passed": False,
+            "output": str(e),
+            "metrics": {},
+            "judge": judge,
+        }
 
 def python_expression_tool(expression: str) -> PythonExpressionToolResult:
     """
@@ -138,13 +222,13 @@ def submit_answer_tool(answer: Any) -> SubmitAnswerToolResult:
     return {"answer": answer, "submitted": True}
 
 
-def _print_add_py_for_run(run_id: int) -> None:
+def _print_quantize_py_for_run(run_id: int) -> None:
     """Print contents of workspace/quantize.py for this run if it exists."""
     if not ADD_PY_PATH.exists():
         print(f"[Run {run_id}] quantize.py not found in workspace.")
         return
     text = ADD_PY_PATH.read_text(encoding="utf-8")
-    print(f"[Run {run_id}] add.py content:\n---\n{text}\n---")
+    print(f"[Run {run_id}] quantize.py content:\n---\n{text}\n---")
 
 
 def _clean_workspace() -> None:
@@ -163,7 +247,7 @@ def judge_run(submitted_answer: Any, tests_result: RunTestsToolResult | None) ->
       - quantized_model_size_bytes
       - base_ppl
       - quantized_ppl
-      - has_fp16_params
+      - has_non_int8_params
     """
     if tests_result is None:
         return {
@@ -179,7 +263,7 @@ def judge_run(submitted_answer: Any, tests_result: RunTestsToolResult | None) ->
     quant_size = float(m.get("quantized_model_size_bytes", 0.0))
     base_ppl = float(m.get("base_ppl", 0.0))
     quant_ppl = float(m.get("quantized_ppl", 0.0))
-    has_fp16 = bool(m.get("has_fp16_params", True))  # default to True (fail-safe)
+    has_non_int8 = bool(m.get("has_non_int8_params", True))  # default to True (fail-safe)
 
     # 1) compression ratio
     if quant_size <= 0 or base_size <= 0:
@@ -206,7 +290,7 @@ def judge_run(submitted_answer: Any, tests_result: RunTestsToolResult | None) ->
     hard_fail = (
         compression < 1.8
         or ppl_increase > 0.25
-        or has_fp16
+        or has_non_int8
     )
 
     passed = (not hard_fail)
@@ -224,7 +308,7 @@ async def run_agent_loop(
     tools: list[ToolUnionParam],
     tool_handlers: dict[str, Callable[..., Any]],
     max_steps: int = 20,
-    model: str = "claude-haiku-4-5",
+    model: str = "claude-opus-4-6",
     verbose: bool = True,
 ) -> Any | None:
     """
@@ -284,39 +368,14 @@ async def run_agent_loop(
                     # Extract arguments based on tool
                     handler = tool_handlers[tool_name]
                     tool_input = content.input
-
-                    # Call the appropriate tool handler
-                    if tool_name == "python_expression":
-                        assert (
-                            isinstance(tool_input, dict) and "expression" in tool_input
-                        )
-                        if verbose:
-                            print("\nInput:")
-                            print("```")
-                            for line in tool_input["expression"].split("\n"):
-                                print(f"{line}")
-                            print("```")
-                        result = handler(tool_input["expression"])
-                        if verbose:
-                            print("\nOutput:")
-                            print("```")
-                            print(result)
-                            print("```")
-                    elif tool_name == "submit_answer":
-                        assert isinstance(tool_input, dict) and "answer" in tool_input
-                        result = handler(tool_input["answer"])
-                        submitted_answer = result["answer"]
-                    else:
-                        # Generic handler call
-                        result = (
-                            handler(**tool_input)
-                            if isinstance(tool_input, dict)
-                            else handler(tool_input)
-                        )
+                    result = (
+                        handler(**tool_input)
+                        if isinstance(tool_input, dict)
+                        else handler(tool_input)
+                    )
 
                     if tool_name == "run_tests":
                         last_run_tests = result 
-
                     tool_results.append(
                         {
                             "type": "tool_result",
@@ -324,7 +383,6 @@ async def run_agent_loop(
                             "content": json.dumps(result),
                         }
                     )
-
         # If we have tool uses, add them to the conversation
         if has_tool_use:
             messages.append({"role": "assistant", "content": response.content})
@@ -367,28 +425,28 @@ async def run_single_test(
         prompt=prompt,
         tools=tools,
         tool_handlers=tool_handlers,
-        max_steps=10,
+        max_steps=20,
         verbose=verbose,
     )
 
     tests = result.get("last_run_tests") if isinstance(result, dict) else None
-    judge = judge_run(
-        submitted_answer=result.get("submitted_answer") if isinstance(result, dict) else None,
-        tests_result=tests,
-    )
+    judge = (tests or {}).get("judge")
+    if judge is None:
+        judge = judge_run(submitted_answer=None, tests_result=tests)
 
     success = judge["passed"]
 
     if success:
         print(f"✓ Run {run_id}: SUCCESS - final_score={judge['final_score']:.3f}")
+        print(f"  compression={judge['compression']:.3f}, ppl_increase={judge['ppl_increase']:.3f}, passed={judge['passed']}")
     else:
         print(f"✗ Run {run_id}: FAILURE - final_score={judge['final_score']:.3f}")
-        print(f"  compression={judge['compression']:.3f}, ppl_increase={judge['ppl_increase']:.3f}")
-        if tests and tests.get("output"):
-            print(f"  --- run_tests output ---")
-            print(tests["output"])
-            print(f"  --- end run_tests output ---")
-    _print_add_py_for_run(run_id)
+        print(f"  compression={judge['compression']:.3f}, ppl_increase={judge['ppl_increase']:.3f}, passed={judge['passed']}")
+    if tests and tests.get("output"):
+        print(f"  --- run_tests output ---")
+        print(tests["output"])
+        print(f"  --- end run_tests output ---")
+    _print_quantize_py_for_run(run_id)
     _clean_workspace()
 
     return run_id, success, judge
@@ -423,19 +481,9 @@ async def main(concurrent: bool = False):
                 "required": [],
             },
         },
-        {
-            "name": "submit_answer",
-            "description": "Submit the final answer",
-            "input_schema": {
-                "type": "object",
-                "properties": {"answer": {"description": "The final answer to submit"}},
-                "required": ["answer"],
-            },
-        },
     ]
 
     tool_handlers = {
-        "submit_answer": submit_answer_tool,
         "write_file": write_file_tool,
         "run_tests": run_tests_tool,
     }
@@ -448,8 +496,6 @@ async def main(concurrent: bool = False):
     "and returns an 8-bit/int8 version of the same model.\n\n"
     "Requirements:\n"
     "1) Do not change the model architecture.\n"
-    "2) The returned model must actually use 8-bit/int8 weights (e.g. via bitsandbytes "
-    "or another standard quantization approach).\n"
     "3) Keep the function in a single file quantize.py so it can be imported as "
     "`import quantize; quantize.quantize_model(model)`.\n\n"
     "Use the write_file tool to create or update workspace/quantize.py with your code. "
