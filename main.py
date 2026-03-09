@@ -248,6 +248,12 @@ def judge_run(submitted_answer: Any, tests_result: RunTestsToolResult | None) ->
       - base_ppl
       - quantized_ppl
       - has_non_int8_params
+      - has_sub_int8_params
+      - has_quant_scales
+      - same_layer_count
+      - per_channel_scales
+      - activation_quantization_modules_exists
+      - activation_quantization_during_forward
     """
     if tests_result is None:
         return {
@@ -264,7 +270,12 @@ def judge_run(submitted_answer: Any, tests_result: RunTestsToolResult | None) ->
     base_ppl = float(m.get("base_ppl", 0.0))
     quant_ppl = float(m.get("quantized_ppl", 0.0))
     has_non_int8 = bool(m.get("has_non_int8_params", True))  # default to True (fail-safe)
-
+    has_sub_int8 = bool(m.get("has_sub_int8_params", True))  # default to True (fail-safe)
+    has_quant_scales = bool(m.get("has_quant_scales", False))  # default to False (fail-safe)
+    same_layer_count = bool(m.get("same_layer_count", False))  # default to False (fail-safe)
+    per_channel_scales = bool(m.get("per_channel_scales", False))  # default to False (fail-safe)
+    activation_quantization_modules_exists = bool(m.get("activation_quantization_modules_exists", False))  # default to False (fail-safe)
+    activation_quantization_during_forward = bool(m.get("activation_quantization_during_forward", False))  # default to False (fail-safe)
     # 1) compression ratio
     if quant_size <= 0 or base_size <= 0:
         compression = 0.0
@@ -284,13 +295,20 @@ def judge_run(submitted_answer: Any, tests_result: RunTestsToolResult | None) ->
     accuracy_score = max(0.0, 1.0 - (ppl_increase / 0.20))
 
     # 5) combined score
-    final_score = 0.6 * accuracy_score + 0.4 * compression_score
+    final_score = 0.6 * accuracy_score + 0.4 * compression_score  #scoring should be on one metric 
 
     # 6) hard fail conditions
     hard_fail = (
-        compression < 1.8
+        compression < 1.6
+        #or compression > 2.3
         or ppl_increase > 0.25
-        or has_non_int8
+        #or has_non_int8
+        or has_sub_int8
+        #or not has_quant_scales
+        or not same_layer_count
+        or not per_channel_scales
+        #or not activation_quantization_modules_exists
+        or not activation_quantization_during_forward
     )
 
     passed = (not hard_fail)
@@ -489,18 +507,24 @@ async def main(concurrent: bool = False):
     }
 
     # Run the test 10 times and track success rate
-    num_runs = 1
+    num_runs = 10
     prompt = (
     "Create a Python file quantize.py in the workspace with a function "
-    "quantize_model(model) that takes a fp16 HuggingFace causal language model "
+    "quantize_model(model) that takes a fp16 language model "
     "and returns an 8-bit/int8 version of the same model.\n\n"
     "Requirements:\n"
     "1) Do not change the model architecture.\n"
-    "3) Keep the function in a single file quantize.py so it can be imported as "
+    "2) Keep the function in a single file quantize.py so it can be imported as "
     "`import quantize; quantize.quantize_model(model)`.\n\n"
+    "3) Use per-channel INT8 quantization for linear layer weights.\n"
+    "4) Implement activation quantization (W8A8). Activations should be "
+    "quantized to int8 using dynamic scaling during the forward pass. "
+    "The implementation should introduce activation quantization "
+    "modules or parameters (e.g., activation scales) so that activations "
+    "are quantized before linear operations.\n"
     "Use the write_file tool to create or update workspace/quantize.py with your code. "
     "Then use the run_tests tool to run eval/test.py, which will check size reduction "
-    "and perplexity on a sample prompt."
+    "and perplexity and other metrics on a sample prompt."
 )
     execution_mode = "concurrently" if concurrent else "sequentially"
     print(f"Running {num_runs} test iterations {execution_mode}...")

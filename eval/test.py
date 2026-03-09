@@ -61,6 +61,79 @@ def linear_layers_have_non_int8_weights(model):
                 return True
     return False
 
+def has_sub_int8_params_weights(model):
+    for p in model.parameters():
+        if p.dtype in [torch.int4, torch.uint4]:
+            return True
+    return False
+
+def has_quant_scales_buffers(model):
+    for name, buf in model.named_buffers():
+        if "scale" in name.lower():
+            return True
+    return False
+
+def same_layer_count_modules(base_model, quant_model):
+    base_layers = sum(1 for _ in base_model.modules())
+    quant_layers = sum(1 for _ in quant_model.modules())
+    return base_layers == quant_layers
+
+def check_per_channel_scales(model):
+    per_channel = 0
+    per_tensor = 0
+
+    for module in model.modules():
+
+        if hasattr(module, "weight_scale"):
+
+            scale = module.weight_scale
+
+            if scale.numel() > 1:
+                per_channel += 1
+            else:
+                per_tensor += 1
+
+    return per_channel, per_tensor
+
+def detect_activation_quantization(model):
+
+    count = 0
+
+    for module in model.modules():
+
+        for attr in ["act_scale", "activation_scale", "input_scale"]:
+            if hasattr(module, attr):
+                count += 1
+
+    return count
+
+def check_activation_dtype(model, tokenizer, prompt):
+
+    inputs = tokenizer(prompt, return_tensors="pt")
+    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+
+    int8_seen = False
+
+    def hook(module, inp, out):
+        nonlocal int8_seen
+
+        if isinstance(inp, tuple):
+            for x in inp:
+                if isinstance(x, torch.Tensor) and x.dtype == torch.int8:
+                    int8_seen = True
+
+    handles = []
+
+    for m in model.modules():
+        handles.append(m.register_forward_hook(hook))
+
+    model(**inputs)
+
+    for h in handles:
+        h.remove()
+
+    return int8_seen
+
 
 
 def main():
@@ -75,13 +148,34 @@ def main():
 
     # any float16 params left in quantized model?
     has_non_int8_params = linear_layers_have_non_int8_weights(quantized_model)
+    has_sub_int8_params = has_sub_int8_params_weights(quantized_model)
+    has_quant_scales = has_quant_scales_buffers(quantized_model)
+    same_layer_count = same_layer_count_modules(base_model, quantized_model)
+
+    # check if per-channel scales are used
+    per_channel, per_tensor = check_per_channel_scales(quantized_model)
+
+    # check if activation quantization modules exists
+    activation_quantization = detect_activation_quantization(quantized_model)
+    #Verify activations are actually quantized during forward
+    int8_seen = check_activation_dtype(quantized_model, tokenizer, PROMPT)
+
 
     metrics = {
         "base_model_size_bytes": int(base_bytes),
         "quantized_model_size_bytes": int(quant_bytes),
         "base_ppl": float(ppl_base),
         "quantized_ppl": float(ppl_quant),
-        "has_non_int8_params": bool(has_non_int8_params),
+        #"has_non_int8_params": bool(has_non_int8_params),
+        "has_sub_int8_params": bool(has_sub_int8_params),
+        #"has_quant_scales": bool(has_quant_scales),
+        "same_layer_count": bool(same_layer_count),
+        #new added metrics
+        "per_channel_scales": bool(
+            (per_channel + per_tensor) > 0 and per_channel / (per_channel + per_tensor) > 0.5
+        ),
+        #"activation_quantization_modules_exists": bool(activation_quantization > 0),
+        "activation_quantization_during_forward": bool(int8_seen),
     }
     print(json.dumps(metrics))
 
