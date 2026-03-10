@@ -17,7 +17,7 @@ EVAL_TEST_FILE = REPO_ROOT / "eval" / "test.py"
 
 ADD_PY_PATH = WORKSPACE_DIR / "quantize.py"
 
-MAX_TOKENS = 20000
+MAX_TOKENS = 100000
 
 
 class PythonExpressionToolResult(TypedDict):
@@ -325,7 +325,7 @@ async def run_agent_loop(
     prompt: str,
     tools: list[ToolUnionParam],
     tool_handlers: dict[str, Callable[..., Any]],
-    max_steps: int = 20,
+    max_steps: int = 50,
     model: str = "claude-opus-4-6",
     verbose: bool = True,
 ) -> Any | None:
@@ -351,9 +351,17 @@ async def run_agent_loop(
         if verbose:
             print(f"\n=== Step {step + 1}/{max_steps} ===")
 
-        response = await client.messages.create(
-            model=model, max_tokens=MAX_TOKENS, tools=tools, messages=messages
-        )
+        response = None
+        async with client.messages.stream(
+            model=model,
+            max_tokens=MAX_TOKENS,
+            tools=tools,
+            messages=messages,
+            extra_headers={"anthropic-beta": "context-1m-2025-08-07"},
+        ) as stream:
+            response = await stream.get_final_message()
+
+        assert response is not None
         pprint.pprint(response)
         assert response.stop_reason in ["max_tokens", "tool_use", "end_turn"], (
             f"unsupported stop_reason {response.stop_reason}"
@@ -443,7 +451,7 @@ async def run_single_test(
         prompt=prompt,
         tools=tools,
         tool_handlers=tool_handlers,
-        max_steps=20,
+        max_steps=50,
         verbose=verbose,
     )
 
