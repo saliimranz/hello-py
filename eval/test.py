@@ -6,6 +6,7 @@ import torch
 import copy
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKSPACE_DIR = REPO_ROOT / "workspace"
 sys.path.insert(0, str(WORKSPACE_DIR))
@@ -95,44 +96,116 @@ def check_per_channel_scales(model):
 
     return per_channel, per_tensor
 
+def _is_activation_quant_module(module) -> bool:
+    """
+    Heuristic detector for activation-quant related modules.
+    We avoid requiring int8 tensors to reach nn.Linear directly.
+    """
+    cls = module.__class__.__name__.lower()
+    # Common naming patterns for activation quantizers/wrappers
+    name_hits = any(k in cls for k in [
+        "actquant", "activationquant", "inputquant", "fakequant", "quantizer"
+    ])
+    # Common attribute/method patterns
+    attr_hits = any(
+        hasattr(module, attr) for attr in [
+            "act_scale",
+            "activation_scale",
+            "input_scale",
+            "activation_quantizer",
+            "act_quant",
+            "input_quant",
+            "quantize_activation",
+            "quantize_input",
+        ]
+    )
+    return name_hits or attr_hits
 def detect_activation_quantization(model):
+    """Count activation-quant modules by robust heuristic."""
+    mods = [m for m in model.modules() if _is_activation_quant_module(m)]
+    return len(mods)
 
-    count = 0
+def check_activation_quantization_during_forward(model, tokenizer, prompt):
+    """
+    Verify activation-quant modules are actually executed in forward pass.
+    Returns: (fired_modules, total_detected_modules)
+    """
+    model.eval()
+    inputs = tokenizer(prompt, return_tensors="pt")
+    device = next(model.parameters()).device
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    actq_modules = [m for m in model.modules() if _is_activation_quant_module(m)]
+    total = len(actq_modules)
+    if total == 0:
+        return 0, 0
+    fired = set()
+    handles = []
+    def hook(module, inp, out):
+        fired.add(id(module))
+    for m in actq_modules:
+        handles.append(m.register_forward_hook(hook))
+    try:
+        with torch.no_grad():
+            model(**inputs)
+    finally:
+        for h in handles:
+            h.remove()
+    return len(fired), total
 
-    for module in model.modules():
-
-        for attr in ["act_scale", "activation_scale", "input_scale"]:
-            if hasattr(module, attr):
-                count += 1
-
-    return count
-
-def check_activation_dtype(model, tokenizer, prompt):
+def detect_int8_tensor_during_forward(model, tokenizer, prompt):
+    """
+    Detect if any tensor with dtype int8 appears anywhere during forward.
+    Returns: bool
+    """
+    model.eval()
 
     inputs = tokenizer(prompt, return_tensors="pt")
-    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+    device = next(model.parameters()).device
+    inputs = {k: v.to(device) for k, v in inputs.items()}
 
-    int8_seen = False
+    seen_int8 = False
+    handles = []
+
+    def check_tensor(obj):
+        nonlocal seen_int8
+        if isinstance(obj, torch.Tensor):
+            if obj.dtype == torch.int8:
+                seen_int8 = True
+
+    def recursive_check(obj):
+        if seen_int8:
+            return
+
+        if isinstance(obj, torch.Tensor):
+            check_tensor(obj)
+
+        elif isinstance(obj, (list, tuple)):
+            for item in obj:
+                recursive_check(item)
+
+        elif isinstance(obj, dict):
+            for v in obj.values():
+                recursive_check(v)
 
     def hook(module, inp, out):
-        nonlocal int8_seen
+        nonlocal seen_int8
+        if seen_int8:
+            return
 
-        if isinstance(inp, tuple):
-            for x in inp:
-                if isinstance(x, torch.Tensor) and x.dtype == torch.int8:
-                    int8_seen = True
-
-    handles = []
+        recursive_check(inp)
+        recursive_check(out)
 
     for m in model.modules():
         handles.append(m.register_forward_hook(hook))
 
-    model(**inputs)
+    try:
+        with torch.no_grad():
+            model(**inputs)
+    finally:
+        for h in handles:
+            h.remove()
 
-    for h in handles:
-        h.remove()
-
-    return int8_seen
+    return seen_int8
 
 
 
@@ -155,10 +228,11 @@ def main():
     # check if per-channel scales are used
     per_channel, per_tensor = check_per_channel_scales(quantized_model)
 
-    # check if activation quantization modules exists
-    activation_quantization = detect_activation_quantization(quantized_model)
     #Verify activations are actually quantized during forward
-    int8_seen = check_activation_dtype(quantized_model, tokenizer, PROMPT)
+    seen_int8 = detect_int8_tensor_during_forward(quantized_model, tokenizer, PROMPT)
+    actq_fired, actq_total = check_activation_quantization_during_forward(
+        quantized_model, tokenizer, PROMPT
+    )
 
 
     metrics = {
@@ -174,8 +248,11 @@ def main():
         "per_channel_scales": bool(
             (per_channel + per_tensor) > 0 and per_channel / (per_channel + per_tensor) > 0.5
         ),
+        "detected_int8_tensor_during_forward": bool(seen_int8),
         #"activation_quantization_modules_exists": bool(activation_quantization > 0),
-        "activation_quantization_during_forward": bool(int8_seen),
+        "activation_quantization_during_forward": bool(
+            actq_total > 0 and actq_fired / actq_total > 0.5
+        ),
     }
     print(json.dumps(metrics))
 

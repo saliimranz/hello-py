@@ -9,6 +9,7 @@ from anthropic import AsyncAnthropic
 from anthropic.types import MessageParam, ToolUnionParam
 from pathlib import Path
 import sys
+import math
 
 # Eval layout: one task at a time; tests live in eval/test.py
 REPO_ROOT = Path(__file__).resolve().parent
@@ -238,6 +239,28 @@ def _clean_workspace() -> None:
         shutil.rmtree(WORKSPACE_DIR)
     WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
 
+
+def ppl_accuracy_score(ppl_increase: float) -> float:
+    p = float(ppl_increase)
+    # Better than base model
+    if p <= 0.0:
+        return 1.0
+    # "0.00x" region: still high, around 0.8
+    if p <= 0.005:
+        # 0.0 -> 1.0, 0.005 -> 0.8
+        return 1.0 - (p / 0.005) * 0.2
+    # 0.005 -> 0.8, 0.013 -> 0.5
+    if p <= 0.013:
+        return 0.8 - ((p - 0.005) / 0.008) * 0.3
+    # 0.013 -> 0.5, 0.016 -> 0.4
+    if p <= 0.016:
+        return 0.5 - ((p - 0.013) / 0.003) * 0.1
+    # 0.016 -> 0.4, 0.019 -> 0.3
+    if p <= 0.019:
+        return 0.4 - ((p - 0.016) / 0.003) * 0.1
+    # After 0.019, decay quickly toward zero
+    return max(0.0, 0.3 * math.exp(-(p - 0.019) / 0.004))
+
 def judge_run(submitted_answer: Any, tests_result: RunTestsToolResult | None) -> dict:
     """
     Judge a single run based on metrics from eval/test.py.
@@ -274,7 +297,7 @@ def judge_run(submitted_answer: Any, tests_result: RunTestsToolResult | None) ->
     has_quant_scales = bool(m.get("has_quant_scales", False))  # default to False (fail-safe)
     same_layer_count = bool(m.get("same_layer_count", False))  # default to False (fail-safe)
     per_channel_scales = bool(m.get("per_channel_scales", False))  # default to False (fail-safe)
-    activation_quantization_modules_exists = bool(m.get("activation_quantization_modules_exists", False))  # default to False (fail-safe)
+    detected_int8_tensor_during_forward = bool(m.get("detected_int8_tensor_during_forward", False))  # default to False (fail-safe)
     activation_quantization_during_forward = bool(m.get("activation_quantization_during_forward", False))  # default to False (fail-safe)
     # 1) compression ratio
     if quant_size <= 0 or base_size <= 0:
@@ -294,25 +317,23 @@ def judge_run(submitted_answer: Any, tests_result: RunTestsToolResult | None) ->
     # 4) accuracy_score (tolerate up to 20% increase)
     accuracy_score = max(0.0, 1.0 - (ppl_increase / 0.20))
 
-    # 5) combined score
-    final_score = 0.6 * accuracy_score + 0.4 * compression_score  #scoring should be on one metric 
-
     # 6) hard fail conditions
     hard_fail = (
         compression < 1.6
-        #or compression > 2.3
         or ppl_increase > 0.25
-        #or has_non_int8
         or has_sub_int8
-        #or not has_quant_scales
         or not same_layer_count
         or not per_channel_scales
-        #or not activation_quantization_modules_exists
+        or not detected_int8_tensor_during_forward
         or not activation_quantization_during_forward
     )
 
     passed = (not hard_fail)
-
+    # 5) final score
+    if passed:
+        final_score = ppl_accuracy_score(ppl_increase)
+    else:
+        final_score = 0.0
     return {
         "final_score": float(final_score),
         "compression": float(compression),
