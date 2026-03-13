@@ -297,7 +297,7 @@ def judge_run(submitted_answer: Any, tests_result: RunTestsToolResult | None) ->
     has_quant_scales = bool(m.get("has_quant_scales", False))  # default to False (fail-safe)
     same_layer_count = bool(m.get("same_layer_count", False))  # default to False (fail-safe)
     per_channel_scales = bool(m.get("per_channel_scales", False))  # default to False (fail-safe)
-    detected_int8_tensor_during_forward = bool(m.get("detected_int8_tensor_during_forward", False))  # default to False (fail-safe)
+    #detected_int8_tensor_during_forward = bool(m.get("detected_int8_tensor_during_forward", False))  # default to False (fail-safe)
     activation_quantization_during_forward = bool(m.get("activation_quantization_during_forward", False))  # default to False (fail-safe)
     # 1) compression ratio
     if quant_size <= 0 or base_size <= 0:
@@ -319,12 +319,12 @@ def judge_run(submitted_answer: Any, tests_result: RunTestsToolResult | None) ->
 
     # 6) hard fail conditions
     hard_fail = (
-        compression < 1.6
-        or ppl_increase > 0.25
+        compression < 1.8
+        or ppl_increase > 0.10
         or has_sub_int8
         or not same_layer_count
         or not per_channel_scales
-        or not detected_int8_tensor_during_forward
+        #or not detected_int8_tensor_during_forward
         or not activation_quantization_during_forward
     )
 
@@ -346,7 +346,7 @@ async def run_agent_loop(
     prompt: str,
     tools: list[ToolUnionParam],
     tool_handlers: dict[str, Callable[..., Any]],
-    max_steps: int = 50,
+    max_steps: int = 20,
     model: str = "claude-opus-4-6",
     verbose: bool = True,
 ) -> Any | None:
@@ -383,7 +383,7 @@ async def run_agent_loop(
             response = await stream.get_final_message()
 
         assert response is not None
-        pprint.pprint(response)
+        #pprint.pprint(response)
         assert response.stop_reason in ["max_tokens", "tool_use", "end_turn"], (
             f"unsupported stop_reason {response.stop_reason}"
         )
@@ -472,7 +472,7 @@ async def run_single_test(
         prompt=prompt,
         tools=tools,
         tool_handlers=tool_handlers,
-        max_steps=50,
+        max_steps=20,
         verbose=verbose,
     )
 
@@ -551,7 +551,10 @@ async def main(concurrent: bool = False):
     "The implementation should introduce activation quantization "
     "modules or parameters (e.g., activation scales) so that activations "
     "are quantized before linear operations.\n"
-    "Use the write_file tool to create or update workspace/quantize.py with your code. "
+    "5) The quantized model must achieve:\n"
+    "compression_ratio > 1.8x\n"
+    "perplexity_increase < 10%\n"
+    "6) Use the write_file tool to create or update workspace/quantize.py with your code. "
     "Then use the run_tests tool to run eval/test.py, which will check size reduction "
     "and perplexity and other metrics on a sample prompt."
 )

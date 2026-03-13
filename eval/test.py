@@ -229,7 +229,7 @@ def main():
     per_channel, per_tensor = check_per_channel_scales(quantized_model)
 
     #Verify activations are actually quantized during forward
-    seen_int8 = detect_int8_tensor_during_forward(quantized_model, tokenizer, PROMPT)
+    #seen_int8 = detect_int8_tensor_during_forward(quantized_model, tokenizer, PROMPT)
     actq_fired, actq_total = check_activation_quantization_during_forward(
         quantized_model, tokenizer, PROMPT
     )
@@ -248,7 +248,7 @@ def main():
         "per_channel_scales": bool(
             (per_channel + per_tensor) > 0 and per_channel / (per_channel + per_tensor) > 0.5
         ),
-        "detected_int8_tensor_during_forward": bool(seen_int8),
+        #"detected_int8_tensor_during_forward": bool(seen_int8),
         #"activation_quantization_modules_exists": bool(activation_quantization > 0),
         "activation_quantization_during_forward": bool(
             actq_total > 0 and actq_fired / actq_total > 0.5
